@@ -24,12 +24,14 @@ const IMAGE_BUILD_CALLBACK_MODES = {
   modal: "provider_image",
   vercel: "provider_session",
   opencomputer: "provider_session",
+  e2b: "provider_session",
 } satisfies Record<ImageBuildProvider, ImageBuildCallbackMode>;
 
 const IMAGE_BUILD_CLONE_AUTH_MODES = {
   modal: "none",
   vercel: "credential_helper",
   opencomputer: "credential_helper",
+  e2b: "credential_helper",
 } satisfies Record<ImageBuildProvider, ImageBuildCloneAuthMode>;
 
 export function getImageBuildsUnsupportedMessage(env: Env): string | null {
@@ -37,7 +39,7 @@ export function getImageBuildsUnsupportedMessage(env: Env): string | null {
     return null;
   }
 
-  return "Image builds are only available when SANDBOX_PROVIDER=modal, vercel, or opencomputer";
+  return "Image builds are only available when SANDBOX_PROVIDER=modal, vercel, opencomputer, or e2b";
 }
 
 export function resolveImageBuildProvider(value: string | undefined): ImageBuildProvider | null {

@@ -132,6 +132,17 @@ export class ImageBuildPlanner {
           },
           callbackAuth: registration,
         };
+      case "e2b":
+        return {
+          plan: {
+            ...basePlan,
+            provider: "e2b",
+            callbackMode: "provider_session",
+            callbackToken: callbackAuth.token,
+            cloneAuth,
+          },
+          callbackAuth: registration,
+        };
       default: {
         const exhaustive: never = this.provider;
         throw new Error(`Unsupported image build provider: ${String(exhaustive)}`);
