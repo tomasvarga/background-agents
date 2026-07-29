@@ -78,10 +78,19 @@ export interface OpenComputerImageBuildPlan extends BaseImageBuildPlan {
   cloneAuth: ImageBuildCloneAuth;
 }
 
+/** E2B builds inside a sandbox; the control plane snapshots it after callback success. */
+export interface E2BImageBuildPlan extends BaseImageBuildPlan {
+  provider: "e2b";
+  callbackMode: "provider_session";
+  callbackToken: string;
+  cloneAuth: ImageBuildCloneAuth;
+}
+
 export type ImageBuildPlan =
   | ModalImageBuildPlan
   | VercelImageBuildPlan
-  | OpenComputerImageBuildPlan;
+  | OpenComputerImageBuildPlan
+  | E2BImageBuildPlan;
 
 export interface PlannedImageBuild {
   plan: ImageBuildPlan;
@@ -152,4 +161,5 @@ export type ImageBuildAdapter<Plan extends ImageBuildPlan> = {
 export type AnyImageBuildAdapter =
   | ImageBuildAdapter<ModalImageBuildPlan>
   | ImageBuildAdapter<VercelImageBuildPlan>
-  | ImageBuildAdapter<OpenComputerImageBuildPlan>;
+  | ImageBuildAdapter<OpenComputerImageBuildPlan>
+  | ImageBuildAdapter<E2BImageBuildPlan>;

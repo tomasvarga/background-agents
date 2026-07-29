@@ -373,6 +373,16 @@ export class ImageBuildWorkflow {
         );
         return { adapter, start: (callbacks) => adapter.startBuild(plan, callbacks) };
       }
+      case "e2b": {
+        const adapter = this.createAdapterGuarded(
+          plan.provider,
+          "trigger_build",
+          ctx,
+          () => this.adapterFactory.create("e2b"),
+          plan.buildId
+        );
+        return { adapter, start: (callbacks) => adapter.startBuild(plan, callbacks) };
+      }
       default: {
         const exhaustive: never = plan;
         throw new ImageBuildProviderUnconfiguredError(

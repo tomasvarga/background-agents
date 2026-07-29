@@ -22,6 +22,10 @@ const TIMEOUT_KILL_MS = 30_000;
 const TIMEOUT_GET_MS = 15_000;
 const TIMEOUT_SETTTL_MS = 15_000;
 const TIMEOUT_WRITE_FILE_MS = 30_000;
+// A snapshot bakes the build sandbox's filesystem into a reusable template;
+// larger than the other calls because it copies the whole prebuilt filesystem.
+const TIMEOUT_SNAPSHOT_MS = 180_000;
+const TIMEOUT_DELETE_TEMPLATE_MS = 30_000;
 
 export interface E2BSandboxDetail {
   sandboxID: string;
@@ -40,6 +44,18 @@ export interface E2BSandboxCreated {
   domain?: string | null;
   /** envd access token; returned only when the sandbox is created with secure:true, null otherwise. */
   envdAccessToken?: string | null;
+}
+
+/**
+ * Response of `POST /sandboxes/{id}/snapshots`. E2B bakes the sandbox's current
+ * filesystem and live process state into a reusable "snapshot template" whose
+ * id doubles as a `templateID`. The E2B launcher is deliberately snapshotted
+ * while waiting for fresh session env, so many sandboxes can spawn from one
+ * snapshot. `snapshotID` includes the build tag (e.g. `abc123:default`).
+ */
+export interface E2BSnapshotInfo {
+  snapshotID: string;
+  names: string[];
 }
 
 /** Default port envd listens on inside every sandbox. */
@@ -195,8 +211,20 @@ export class E2BRestClient {
     return this.request<E2BSandboxDetail>("GET", `/sandboxes/${id}`, TIMEOUT_GET_MS);
   }
 
-  async pauseSandbox(id: string): Promise<void> {
-    await this.request<void>("POST", `/sandboxes/${id}/pause`, TIMEOUT_PAUSE_MS);
+  /**
+   * Pause a sandbox. By default E2B persists filesystem + memory (a resumable
+   * freeze). Pass `{ memory: false }` for a filesystem-only pause: resuming it
+   * cold-boots (reboots) the sandbox from disk, dropping all process memory. The
+   * image-build path uses that to discard the build supervisor (and its secret
+   * env) before baking a reusable snapshot.
+   */
+  async pauseSandbox(id: string, opts?: { memory?: boolean }): Promise<void> {
+    await this.request<void>(
+      "POST",
+      `/sandboxes/${id}/pause`,
+      TIMEOUT_PAUSE_MS,
+      opts?.memory === undefined ? undefined : { memory: opts.memory }
+    );
   }
 
   async connectSandbox(id: string, timeoutSeconds: number): Promise<E2BSandboxDetail> {
@@ -213,6 +241,42 @@ export class E2BRestClient {
     await this.request<void>("POST", `/sandboxes/${id}/timeout`, TIMEOUT_SETTTL_MS, {
       timeout: timeoutSeconds,
     });
+  }
+
+  /**
+   * Bake the sandbox's current filesystem into a reusable snapshot template
+   * (`POST /sandboxes/{id}/snapshots`). The returned `snapshotID` is passed
+   * verbatim as `templateID` to {@link createSandbox} to spawn a prebuilt-image
+   * sandbox. Used by the image-build workflow after `.openinspect/setup.sh` has
+   * run once in the build sandbox.
+   */
+  async createSnapshot(id: string, name?: string): Promise<E2BSnapshotInfo> {
+    const startMs = Date.now();
+    try {
+      return await this.request<E2BSnapshotInfo>(
+        "POST",
+        `/sandboxes/${id}/snapshots`,
+        TIMEOUT_SNAPSHOT_MS,
+        name ? { name } : {}
+      );
+    } finally {
+      log.info("e2b.create_snapshot", { duration_ms: Date.now() - startMs, sandbox_id: id });
+    }
+  }
+
+  /**
+   * Delete a snapshot template (`DELETE /templates/{templateID}`). A snapshot id
+   * carries a build tag (`abc123:default`); the templates path takes the bare
+   * template id, so the tag is stripped. Used by the image-build reaper to
+   * reclaim superseded prebuilt images.
+   */
+  async deleteTemplate(templateId: string): Promise<void> {
+    const bareTemplateId = stripSnapshotTag(templateId);
+    await this.request<void>(
+      "DELETE",
+      `/templates/${encodeURIComponent(bareTemplateId)}`,
+      TIMEOUT_DELETE_TEMPLATE_MS
+    );
   }
 
   getHostnameForPort(sandboxId: string, port: number, domain?: string | null): string {
@@ -284,6 +348,18 @@ export class E2BRestClient {
       clearTimeout(timeoutId);
     }
   }
+}
+
+/**
+ * Strip the build tag from a snapshot id for the templates delete path.
+ * `abc123:default` → `abc123`, `team/my-snapshot:v2` → `team/my-snapshot`.
+ * The tag is the final `:`-delimited segment (never contains a slash).
+ */
+export function stripSnapshotTag(snapshotId: string): string {
+  const lastColon = snapshotId.lastIndexOf(":");
+  if (lastColon === -1) return snapshotId;
+  const tag = snapshotId.slice(lastColon + 1);
+  return tag.includes("/") ? snapshotId : snapshotId.slice(0, lastColon);
 }
 
 export function createE2BRestClient(config: E2BRestConfig): E2BRestClient {

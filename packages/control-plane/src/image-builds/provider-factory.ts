@@ -1,10 +1,12 @@
 import { createSandboxProviderFromEnv } from "../sandbox/provider-factory";
 import type { Env } from "../types";
+import { E2BImageBuildAdapter } from "./e2b-adapter";
 import { ModalImageBuildAdapter } from "./modal-adapter";
 import type { ImageBuildProvider } from "./model";
 import { OpenComputerImageBuildAdapter } from "./opencomputer-adapter";
 import type {
   AnyImageBuildAdapter,
+  E2BImageBuildPlan,
   ImageBuildAdapter,
   ModalImageBuildPlan,
   OpenComputerImageBuildPlan,
@@ -22,6 +24,7 @@ export interface ImageBuildAdapterFactory {
   create(provider: "modal"): ImageBuildAdapter<ModalImageBuildPlan>;
   create(provider: "vercel"): ImageBuildAdapter<VercelImageBuildPlan>;
   create(provider: "opencomputer"): ImageBuildAdapter<OpenComputerImageBuildPlan>;
+  create(provider: "e2b"): ImageBuildAdapter<E2BImageBuildPlan>;
   create(provider: ImageBuildProvider): AnyImageBuildAdapter;
 }
 
@@ -35,6 +38,7 @@ class EnvImageBuildAdapterFactory implements ImageBuildAdapterFactory {
   create(provider: "modal"): ImageBuildAdapter<ModalImageBuildPlan>;
   create(provider: "vercel"): ImageBuildAdapter<VercelImageBuildPlan>;
   create(provider: "opencomputer"): ImageBuildAdapter<OpenComputerImageBuildPlan>;
+  create(provider: "e2b"): ImageBuildAdapter<E2BImageBuildPlan>;
   create(provider: ImageBuildProvider): AnyImageBuildAdapter {
     switch (provider) {
       case "modal":
@@ -45,6 +49,8 @@ class EnvImageBuildAdapterFactory implements ImageBuildAdapterFactory {
         return new OpenComputerImageBuildAdapter(
           createSandboxProviderFromEnv(this.env, "opencomputer")
         );
+      case "e2b":
+        return new E2BImageBuildAdapter(createSandboxProviderFromEnv(this.env, "e2b"));
     }
   }
 }

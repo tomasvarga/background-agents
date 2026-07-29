@@ -8,24 +8,44 @@
  * disabled so resume stays control-plane-driven (connectSandbox) and stray traffic can't
  * wake a paused box. Per-session env is delivered via an envd file write because the
  * template's start command runs at build time.
+ *
+ * Prebuilt images (snapshots): the image-build workflow runs `.openinspect/setup.sh`
+ * once in a build sandbox (triggerEnvironmentImageBuild), then bakes its filesystem
+ * into a reusable snapshot template (takeSnapshot → `POST /sandboxes/{id}/snapshots`).
+ * The snapshot id doubles as a `templateID`, so a prebuilt/restored sandbox is just a
+ * create with that id in place of the base template. The snapshot resumes oi-launch
+ * in its env wait loop, where it reads the freshly written per-session env — so
+ * prebuilt boots reuse the baked filesystem while still getting fresh session config.
  */
 
-import type { SandboxSettings } from "@open-inspect/shared";
+import { DEFAULT_BUILD_TIMEOUT_SECONDS, type SandboxSettings } from "@open-inspect/shared";
 import { createLogger } from "../../logger";
-import { buildSandboxEnvVars, deriveCodeServerPassword, scmCloneIdentity } from "../sandbox-env";
+import {
+  applyScmCloneEnv,
+  buildSandboxEnvVars,
+  deriveCodeServerPassword,
+  IMAGE_BUILD_MODE_ENV_VAR,
+  scmCloneIdentity,
+  SESSION_CONFIG_ENV_VAR,
+  toRepositoryConfigPayload,
+} from "../sandbox-env";
 import { resolveServicePorts, resolveTunnelPorts } from "./port-resolution";
 import type { SourceControlProviderName } from "../../source-control";
-import type { E2BRestClient, E2BSandboxDetail } from "../e2b-rest-client";
+import type { E2BRestClient, E2BSandboxCreated, E2BSandboxDetail } from "../e2b-rest-client";
 import { E2BApiError, E2BConflictError, E2BNotFoundError } from "../e2b-rest-client";
 import {
   DEFAULT_SANDBOX_TIMEOUT_SECONDS,
   SandboxProviderError,
   type CreateSandboxConfig,
   type CreateSandboxResult,
+  type RestoreConfig,
+  type RestoreResult,
   type ResumeConfig,
   type ResumeResult,
   type SandboxProvider,
   type SandboxProviderCapabilities,
+  type SnapshotConfig,
+  type SnapshotResult,
   type StopConfig,
   type StopResult,
 } from "../provider";
@@ -36,6 +56,35 @@ const log = createLogger("e2b-provider");
 export const DEFAULT_E2B_SANDBOX_TIMEOUT_SECONDS = DEFAULT_SANDBOX_TIMEOUT_SECONDS;
 /** Default to a recoverable stop: pause on TTL (not kill), so it stays resumable. */
 export const DEFAULT_E2B_AUTO_PAUSE = true;
+
+/**
+ * Runtime version baked into the E2B template, reported by build sandboxes so
+ * spawn-time selection can gate on the compatibility floor
+ * (MIN_COMPATIBLE_RUNTIME_VERSION). E2B does not propagate the Dockerfile's
+ * SANDBOX_VERSION to the runtime process, so builds get it here instead. Keep in
+ * sync with the toolchain pinned in e2b.Dockerfile (OPENCODE_VERSION) and the
+ * matching Vercel/OpenComputer constants.
+ */
+export const E2B_SANDBOX_VERSION = "v54-opencode-1-17-18";
+
+/**
+ * TTL for the brief cold-boot between the sanitizing pause and createSnapshot
+ * during an image build. Only needs to outlive the snapshot call; the build
+ * sandbox is killed immediately afterwards.
+ */
+const SNAPSHOT_CONNECT_TIMEOUT_SECONDS = 300;
+
+const REPO_IMAGE_CALLBACK_ENV_KEYS = [
+  "OI_REPO_IMAGE_PROVIDER_SESSION_ID",
+  "OI_REPO_IMAGE_BUILD_ID",
+  "OI_REPO_IMAGE_CALLBACK_URL",
+  "OI_REPO_IMAGE_CALLBACK_TOKEN",
+  "OI_REPO_IMAGE_FAILURE_CALLBACK_URL",
+] as const;
+const RESERVED_REPO_IMAGE_CALLBACK_ENV_KEYS = [
+  ...REPO_IMAGE_CALLBACK_ENV_KEYS,
+  "OI_REPO_IMAGE_CALLBACK_SECRET",
+] as const;
 
 export interface E2BProviderConfig {
   scmProvider: SourceControlProviderName;
@@ -48,6 +97,27 @@ export interface E2BProviderConfig {
   autoPause: boolean;
 }
 
+export interface TriggerE2BEnvironmentImageBuildConfig {
+  buildId: string;
+  environmentId: string;
+  /** Repositories in position order ([0] = primary), cloned at their base branches. */
+  repositories: Array<{ repoOwner: string; repoName: string; baseBranch: string }>;
+  callbackUrl: string;
+  failureCallbackUrl: string;
+  callbackToken: string;
+  userEnvVars?: Record<string, string>;
+  cloneToken?: string;
+  buildTimeoutSeconds?: number;
+  onProviderSessionCreated?: (providerSessionId: string) => Promise<void>;
+}
+
+export interface TriggerE2BEnvironmentImageBuildResult {
+  buildId: string;
+  status: string;
+}
+
+type E2BOperation = "create" | "resume" | "stop" | "snapshot" | "delete";
+
 export class E2BSandboxProvider implements SandboxProvider {
   readonly name = "e2b";
 
@@ -58,8 +128,8 @@ export class E2BSandboxProvider implements SandboxProvider {
   private static readonly TERMINAL_STOP_REASONS = new Set(["connecting_timeout"]);
 
   readonly capabilities: SandboxProviderCapabilities = {
-    supportsSnapshots: false,
-    supportsRestore: false,
+    supportsSnapshots: true,
+    supportsRestore: true,
     // Stop is a resumable pause; the manager treats it as provider-managed state.
     supportsPersistentResume: true,
     supportsExplicitStop: true,
@@ -72,87 +142,82 @@ export class E2BSandboxProvider implements SandboxProvider {
 
   async createSandbox(config: CreateSandboxConfig): Promise<CreateSandboxResult> {
     try {
-      const codeServerPassword = config.codeServerEnabled
-        ? await deriveCodeServerPassword(
-            config.sandboxId,
-            this.providerConfig.codeServerPasswordSecret
-          )
-        : undefined;
-      const envVars = buildSandboxEnvVars(config, {
-        scmIdentity: scmCloneIdentity(this.providerConfig.scmProvider),
-        codeServerPassword,
-      });
-      // E2B sandboxes run as a non-root user and /run is a root-owned tmpfs, so
-      // the git credential helper can't create its default cache dir (/run/oi)
-      // and fails before brokering a token. Point it at a user-writable path.
-      envVars.OI_SCM_CRED_CACHE_DIR = "/tmp/oi";
-      const metadata = this.buildMetadata(config);
-      const sandbox = await this.client.createSandbox({
-        templateID: this.client.config.templateId,
-        metadata,
-        timeoutSeconds: config.timeoutSeconds ?? this.providerConfig.sandboxTimeoutSeconds,
-        autoPause: this.providerConfig.autoPause,
-        // Require secure envd access: the per-session env we upload carries
-        // SANDBOX_AUTH_TOKEN + user secrets, so envd must reject writes lacking the
-        // returned access token (otherwise the upload is anonymous over the public host).
-        secure: true,
-        // Deliberately NOT auto-resume: resume is control-plane-driven (resumeSandbox →
-        // connectSandbox). Provider-side auto-resume would wake a paused sandbox from
-        // stray inbound traffic, outside the DO state machine.
-        autoResume: false,
-      });
-
-      try {
-        // Deliver per-session env to the supervisor. E2B's template start command
-        // runs once at build and never sees create-time env vars, so the launcher
-        // (oi-launch.py) waits for this file and execs the supervisor with it.
-        const envdAccessToken = sandbox.envdAccessToken;
-        if (!envdAccessToken) {
-          // secure:true always returns a token, so a missing one is systemic (secure
-          // unsupported / API change), not intermittent — classify permanent to trip the
-          // circuit breaker rather than looping create→kill. Fail closed: the env write
-          // (SANDBOX_AUTH_TOKEN + secrets) never happens; the catch below kills the sandbox.
-          throw new SandboxProviderError(
-            "E2B create did not return an envd access token (secure access required)",
-            "permanent"
-          );
-        }
-        await this.client.writeSessionEnv(sandbox.sandboxID, envVars, {
-          domain: sandbox.domain,
-          envdAccessToken,
-        });
-      } catch (error) {
-        // The sandbox exists but will never get its session env — kill it rather
-        // than leak a running launcher-only sandbox until its TTL.
-        try {
-          await this.client.killSandbox(sandbox.sandboxID);
-        } catch (killError) {
-          log.warn("e2b.cleanup_kill_failed", {
-            sandbox_id: sandbox.sandboxID,
-            error: killError instanceof Error ? killError.message : String(killError),
-          });
-        }
-        throw error;
+      // A prebuilt image id is an E2B snapshot template id — spawn from it instead
+      // of the base template and mark the boot so the runtime skips setup.sh (it
+      // ran at build time). Otherwise fall back to the base template.
+      const extraEnv: Record<string, string> = {};
+      if (config.prebuiltImageId) {
+        extraEnv.FROM_REPO_IMAGE = "true";
+        extraEnv.REPO_IMAGE_SHA = config.prebuiltImageSha ?? "";
       }
-
-      const { codeServerUrl, tunnelUrls } = this.buildTunnelUrls(
-        sandbox.sandboxID,
-        config.codeServerEnabled,
-        config.sandboxSettings,
-        sandbox.domain
-      );
+      const templateId = config.prebuiltImageId || this.client.config.templateId;
+      const spawned = await this.spawnFromTemplate(config, templateId, extraEnv);
 
       return {
         sandboxId: config.sandboxId,
-        providerObjectId: sandbox.sandboxID,
+        providerObjectId: spawned.providerObjectId,
         status: "running",
-        createdAt: Date.now(),
-        codeServerUrl,
-        codeServerPassword,
-        tunnelUrls,
+        createdAt: spawned.createdAt,
+        codeServerUrl: spawned.codeServerUrl,
+        codeServerPassword: spawned.codeServerPassword,
+        tunnelUrls: spawned.tunnelUrls,
       };
     } catch (error) {
       throw this.classifyError("Failed to create E2B sandbox", error, "create");
+    }
+  }
+
+  async restoreFromSnapshot(config: RestoreConfig): Promise<RestoreResult> {
+    try {
+      const spawned = await this.spawnFromTemplate(config, config.snapshotImageId, {
+        RESTORED_FROM_SNAPSHOT: "true",
+      });
+
+      return {
+        success: true,
+        sandboxId: config.sandboxId,
+        providerObjectId: spawned.providerObjectId,
+        codeServerUrl: spawned.codeServerUrl,
+        codeServerPassword: spawned.codeServerPassword,
+        tunnelUrls: spawned.tunnelUrls,
+      };
+    } catch (error) {
+      if (error instanceof SandboxProviderError) throw error;
+      throw this.classifyError("Failed to restore E2B sandbox from snapshot", error, "create");
+    }
+  }
+
+  /**
+   * Bake the image-build sandbox into a reusable snapshot template, sanitized so
+   * the image is a clean, quiescent cold boot rather than a frozen build process.
+   *
+   * A reusable E2B snapshot (`POST /sandboxes/{id}/snapshots`) captures live
+   * process memory, so snapshotting the running build sandbox directly would (a)
+   * bake the build supervisor and its secret env into every image and (b) resume
+   * that stale process on spawn instead of a fresh launcher. To avoid both, we
+   * first `pause(keepMemory:false)` — which drops all memory and persists only
+   * the filesystem — then `connect`, which cold-boots the sandbox from disk,
+   * re-running the launcher fresh in its env-wait state. The snapshot then
+   * captures that clean state, so sandboxes spawned from it start a fresh
+   * supervisor with their own per-session env (and never inherit build secrets in
+   * memory).
+   */
+  async takeSnapshot(config: SnapshotConfig): Promise<SnapshotResult> {
+    try {
+      await this.client.pauseSandbox(config.providerObjectId, { memory: false });
+      // Cold-boot from disk; connect returns once the template ready-check passes,
+      // i.e. once the launcher is back up and waiting — no readiness guesswork.
+      await this.client.connectSandbox(config.providerObjectId, SNAPSHOT_CONNECT_TIMEOUT_SECONDS);
+      // No name: each build gets a distinct snapshot template. Superseded images
+      // are reclaimed by the reaper via deleteProviderImage, so reusing a name
+      // (which would reassign builds to one template) buys nothing.
+      const snapshot = await this.client.createSnapshot(config.providerObjectId);
+      if (!snapshot.snapshotID) {
+        return { success: false, error: "E2B snapshot did not return a snapshot id" };
+      }
+      return { success: true, imageId: snapshot.snapshotID };
+    } catch (error) {
+      throw this.classifyError("Failed to snapshot E2B sandbox", error, "snapshot");
     }
   }
 
@@ -256,7 +321,269 @@ export class E2BSandboxProvider implements SandboxProvider {
     }
   }
 
-  private buildMetadata(config: CreateSandboxConfig): Record<string, string> {
+  /**
+   * Permanently kill a sandbox. Used to tear down the ephemeral image-build
+   * sandbox once its filesystem has been snapshotted: stopSandbox only pauses
+   * (correct for idle sessions) and would leak the single-use build sandbox
+   * until its TTL. Idempotent — a missing sandbox is treated as already gone.
+   */
+  async deleteSandbox(providerObjectId: string): Promise<void> {
+    try {
+      await this.client.killSandbox(providerObjectId);
+    } catch (error) {
+      if (error instanceof E2BNotFoundError) return;
+      throw this.classifyError("Failed to delete E2B sandbox", error, "stop");
+    }
+  }
+
+  /**
+   * Trigger an E2B environment-image build. A build sandbox boots from the base
+   * template, clones every repository and runs `.openinspect/setup.sh` once (the
+   * SESSION_CONFIG carries the repository list), reports completion via the
+   * repo-image callback, then idles awaiting the snapshot taken by takeSnapshot.
+   * The build sandbox does not auto-pause: its filesystem is snapshotted in place.
+   */
+  async triggerEnvironmentImageBuild(
+    config: TriggerE2BEnvironmentImageBuildConfig
+  ): Promise<TriggerE2BEnvironmentImageBuildResult> {
+    const primary = config.repositories[0];
+    if (!primary) {
+      throw new Error("environment build requires at least one repository");
+    }
+
+    let sandboxId: string | undefined;
+    try {
+      const sandbox = await this.client.createSandbox({
+        templateID: this.client.config.templateId,
+        metadata: {
+          openinspect_framework: "open-inspect",
+          openinspect_kind: "environment-image-build",
+          openinspect_build_id: config.buildId,
+          openinspect_environment: config.environmentId,
+        },
+        timeoutSeconds: config.buildTimeoutSeconds ?? DEFAULT_BUILD_TIMEOUT_SECONDS,
+        // The build sandbox must stay alive so takeSnapshot can bake its
+        // filesystem; never auto-pause/resume it.
+        autoPause: false,
+        secure: true,
+        autoResume: false,
+      });
+      sandboxId = sandbox.sandboxID;
+
+      // Register the build sandbox before delivering env, so the workflow has
+      // bound the provider session before the supervisor can run setup and fire
+      // the build-complete callback (which is rejected until the session is bound).
+      if (config.onProviderSessionCreated) {
+        await config.onProviderSessionCreated(sandbox.sandboxID);
+      }
+
+      const env = this.buildBuildEnvVars({
+        userEnvVars: config.userEnvVars,
+        cloneToken: config.cloneToken,
+        buildSandboxId: `build-env-${config.environmentId}`,
+        repoOwner: primary.repoOwner,
+        repoName: primary.repoName,
+        sessionConfig: {
+          branch: primary.baseBranch,
+          repositories: config.repositories.map(toRepositoryConfigPayload),
+        },
+        buildId: config.buildId,
+        callbackUrl: config.callbackUrl,
+        failureCallbackUrl: config.failureCallbackUrl,
+        callbackToken: config.callbackToken,
+        providerSessionId: sandbox.sandboxID,
+      });
+      await this.deliverSessionEnv(sandbox, env);
+
+      log.info("e2b.environment_image_build_triggered", {
+        build_id: config.buildId,
+        environment_id: config.environmentId,
+        sandbox_id: sandbox.sandboxID,
+      });
+
+      return { buildId: config.buildId, status: "building" };
+    } catch (error) {
+      // deliverSessionEnv kills on write failure; this covers a create-time or
+      // onProviderSessionCreated failure that leaves the sandbox running.
+      if (sandboxId) {
+        try {
+          await this.client.killSandbox(sandboxId);
+        } catch (killError) {
+          if (!(killError instanceof E2BNotFoundError)) {
+            log.warn("e2b.build_cleanup_kill_failed", {
+              sandbox_id: sandboxId,
+              error: killError instanceof Error ? killError.message : String(killError),
+            });
+          }
+        }
+      }
+      if (error instanceof SandboxProviderError) throw error;
+      throw this.classifyError("Failed to trigger E2B environment image build", error, "create");
+    }
+  }
+
+  async deleteProviderImage(providerImageId: string): Promise<void> {
+    try {
+      await this.client.deleteTemplate(providerImageId);
+    } catch (error) {
+      if (error instanceof E2BNotFoundError) return;
+      throw this.classifyError("Failed to delete E2B snapshot", error, "delete");
+    }
+  }
+
+  /**
+   * Create a runtime sandbox from `templateId` (the base template, a prebuilt
+   * snapshot, or a restore snapshot) and deliver the per-session env. Shared by
+   * createSandbox and restoreFromSnapshot; `extraEnv` carries the boot-mode
+   * marker each path sets.
+   */
+  private async spawnFromTemplate(
+    config: CreateSandboxConfig | RestoreConfig,
+    templateId: string,
+    extraEnv: Record<string, string>
+  ): Promise<{
+    providerObjectId: string;
+    createdAt: number;
+    codeServerUrl?: string;
+    codeServerPassword?: string;
+    tunnelUrls?: Record<string, string>;
+  }> {
+    const codeServerPassword = config.codeServerEnabled
+      ? await deriveCodeServerPassword(
+          config.sandboxId,
+          this.providerConfig.codeServerPasswordSecret
+        )
+      : undefined;
+    const envVars = buildSandboxEnvVars(config, {
+      scmIdentity: scmCloneIdentity(this.providerConfig.scmProvider),
+      codeServerPassword,
+    });
+    // E2B sandboxes run as a non-root user and /run is a root-owned tmpfs, so
+    // the git credential helper can't create its default cache dir (/run/oi)
+    // and fails before brokering a token. Point it at a user-writable path.
+    envVars.OI_SCM_CRED_CACHE_DIR = "/tmp/oi";
+    Object.assign(envVars, extraEnv);
+
+    const sandbox = await this.client.createSandbox({
+      templateID: templateId,
+      metadata: this.buildMetadata(config),
+      timeoutSeconds: config.timeoutSeconds ?? this.providerConfig.sandboxTimeoutSeconds,
+      autoPause: this.providerConfig.autoPause,
+      // Require secure envd access: the per-session env we upload carries
+      // SANDBOX_AUTH_TOKEN + user secrets, so envd must reject writes lacking the
+      // returned access token (otherwise the upload is anonymous over the public host).
+      secure: true,
+      // Deliberately NOT auto-resume: resume is control-plane-driven (resumeSandbox →
+      // connectSandbox). Provider-side auto-resume would wake a paused sandbox from
+      // stray inbound traffic, outside the DO state machine.
+      autoResume: false,
+    });
+
+    await this.deliverSessionEnv(sandbox, envVars);
+
+    const { codeServerUrl, tunnelUrls } = this.buildTunnelUrls(
+      sandbox.sandboxID,
+      config.codeServerEnabled,
+      config.sandboxSettings,
+      sandbox.domain
+    );
+
+    return {
+      providerObjectId: sandbox.sandboxID,
+      createdAt: Date.now(),
+      codeServerUrl,
+      codeServerPassword,
+      tunnelUrls,
+    };
+  }
+
+  /**
+   * Deliver the per-session env to the supervisor via envd. E2B's template start
+   * command runs once at build and never sees create-time env vars, so the
+   * launcher (oi-launch.py) waits for this file and starts the supervisor with it.
+   * On failure the sandbox exists but will never get its env — kill it rather
+   * than leak a running launcher-only sandbox until its TTL.
+   */
+  private async deliverSessionEnv(
+    sandbox: E2BSandboxCreated,
+    envVars: Record<string, string>
+  ): Promise<void> {
+    try {
+      const envdAccessToken = sandbox.envdAccessToken;
+      if (!envdAccessToken) {
+        // secure:true always returns a token, so a missing one is systemic (secure
+        // unsupported / API change), not intermittent — classify permanent to trip the
+        // circuit breaker rather than looping create→kill. Fail closed: the env write
+        // (SANDBOX_AUTH_TOKEN + secrets) never happens; the catch below kills the sandbox.
+        throw new SandboxProviderError(
+          "E2B create did not return an envd access token (secure access required)",
+          "permanent"
+        );
+      }
+      await this.client.writeSessionEnv(sandbox.sandboxID, envVars, {
+        domain: sandbox.domain,
+        envdAccessToken,
+      });
+    } catch (error) {
+      try {
+        await this.client.killSandbox(sandbox.sandboxID);
+      } catch (killError) {
+        log.warn("e2b.cleanup_kill_failed", {
+          sandbox_id: sandbox.sandboxID,
+          error: killError instanceof Error ? killError.message : String(killError),
+        });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Build-sandbox env for environment-image builds. Unlike a runtime session,
+   * the whole env (build-mode marker, SESSION_CONFIG, and the repo-image callback
+   * vars) is delivered in the single session-env file oi-launch reads, because
+   * E2B has no separate per-create entrypoint launch. User secrets come first;
+   * any user-supplied reserved callback keys are scrubbed so they can't spoof the
+   * build callback.
+   */
+  private buildBuildEnvVars(config: {
+    userEnvVars?: Record<string, string>;
+    cloneToken?: string;
+    buildSandboxId: string;
+    repoOwner: string;
+    repoName: string;
+    sessionConfig: Record<string, unknown>;
+    buildId: string;
+    callbackUrl: string;
+    failureCallbackUrl: string;
+    callbackToken: string;
+    providerSessionId: string;
+  }): Record<string, string> {
+    const envVars: Record<string, string> = { ...(config.userEnvVars ?? {}) };
+    for (const key of RESERVED_REPO_IMAGE_CALLBACK_ENV_KEYS) {
+      delete envVars[key];
+    }
+
+    Object.assign(envVars, {
+      PYTHONUNBUFFERED: "1",
+      SANDBOX_ID: config.buildSandboxId,
+      SANDBOX_VERSION: E2B_SANDBOX_VERSION,
+      REPO_OWNER: config.repoOwner,
+      REPO_NAME: config.repoName,
+      OI_SCM_CRED_CACHE_DIR: "/tmp/oi",
+      [IMAGE_BUILD_MODE_ENV_VAR]: "true",
+      [SESSION_CONFIG_ENV_VAR]: JSON.stringify(config.sessionConfig),
+      [REPO_IMAGE_CALLBACK_ENV_KEYS[0]]: config.providerSessionId,
+      [REPO_IMAGE_CALLBACK_ENV_KEYS[1]]: config.buildId,
+      [REPO_IMAGE_CALLBACK_ENV_KEYS[2]]: config.callbackUrl,
+      [REPO_IMAGE_CALLBACK_ENV_KEYS[3]]: config.callbackToken,
+      [REPO_IMAGE_CALLBACK_ENV_KEYS[4]]: config.failureCallbackUrl,
+    });
+
+    applyScmCloneEnv(envVars, scmCloneIdentity(this.providerConfig.scmProvider), config.cloneToken);
+    return envVars;
+  }
+
+  private buildMetadata(config: CreateSandboxConfig | RestoreConfig): Record<string, string> {
     const metadata: Record<string, string> = {
       openinspect_framework: "open-inspect",
       openinspect_session_id: config.sessionId,
@@ -300,7 +627,7 @@ export class E2BSandboxProvider implements SandboxProvider {
   private classifyError(
     message: string,
     error: unknown,
-    operation: "create" | "resume" | "stop"
+    operation: E2BOperation
   ): SandboxProviderError {
     // Already classified (e.g. the secure-access guard) — don't double-wrap and lose its message.
     if (error instanceof SandboxProviderError) return error;
