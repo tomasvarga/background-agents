@@ -18,6 +18,7 @@ export interface E2BRestConfig {
 const TIMEOUT_CREATE_MS = 90_000;
 const TIMEOUT_CONNECT_MS = 60_000;
 const TIMEOUT_PAUSE_MS = 30_000;
+const TIMEOUT_NETWORK_UPDATE_MS = 15_000;
 const TIMEOUT_KILL_MS = 30_000;
 const TIMEOUT_GET_MS = 15_000;
 const TIMEOUT_SETTTL_MS = 15_000;
@@ -35,6 +36,8 @@ export interface E2BSandboxDetail {
   endAt?: string;
   /** Custom sandbox domain for dedicated clusters; null/absent on the default cloud. */
   domain?: string | null;
+  /** Fresh envd token returned by connect for secure sandboxes. */
+  envdAccessToken?: string | null;
 }
 
 export interface E2BSandboxCreated {
@@ -82,6 +85,8 @@ export interface E2BCreateSandboxParams {
    * envd accepts unauthenticated reads/writes of the uploaded session env.
    */
   secure?: boolean;
+  /** Whether the sandbox may make outbound internet requests. */
+  allowInternetAccess?: boolean;
 }
 
 export class E2BNotFoundError extends Error {
@@ -128,6 +133,7 @@ export class E2BRestClient {
         metadata: params.metadata,
         timeout: params.timeoutSeconds,
         secure: params.secure ?? false,
+        allow_internet_access: params.allowInternetAccess,
         autoPause: params.autoPause ?? false,
         autoResume: { enabled: params.autoResume ?? false },
       });
@@ -233,6 +239,12 @@ export class E2BRestClient {
     });
   }
 
+  async updateSandboxNetwork(id: string, options: { allowInternetAccess: boolean }): Promise<void> {
+    await this.request<void>("PUT", `/sandboxes/${id}/network`, TIMEOUT_NETWORK_UPDATE_MS, {
+      allow_internet_access: options.allowInternetAccess,
+    });
+  }
+
   async killSandbox(id: string): Promise<void> {
     await this.request<void>("DELETE", `/sandboxes/${id}`, TIMEOUT_KILL_MS);
   }
@@ -265,16 +277,13 @@ export class E2BRestClient {
   }
 
   /**
-   * Delete a snapshot template (`DELETE /templates/{templateID}`). A snapshot id
-   * carries a build tag (`abc123:default`); the templates path takes the bare
-   * template id, so the tag is stripped. Used by the image-build reaper to
-   * reclaim superseded prebuilt images.
+   * Delete a snapshot template (`DELETE /templates/{templateID}`). Snapshot IDs,
+   * including their build tag, are passed verbatim as required by the E2B API.
    */
   async deleteTemplate(templateId: string): Promise<void> {
-    const bareTemplateId = stripSnapshotTag(templateId);
     await this.request<void>(
       "DELETE",
-      `/templates/${encodeURIComponent(bareTemplateId)}`,
+      `/templates/${encodeURIComponent(templateId)}`,
       TIMEOUT_DELETE_TEMPLATE_MS
     );
   }
@@ -291,7 +300,7 @@ export class E2BRestClient {
   }
 
   private async request<T>(
-    method: "GET" | "POST" | "DELETE",
+    method: "GET" | "POST" | "PUT" | "DELETE",
     path: string,
     timeoutMs: number,
     body?: unknown
@@ -348,18 +357,6 @@ export class E2BRestClient {
       clearTimeout(timeoutId);
     }
   }
-}
-
-/**
- * Strip the build tag from a snapshot id for the templates delete path.
- * `abc123:default` → `abc123`, `team/my-snapshot:v2` → `team/my-snapshot`.
- * The tag is the final `:`-delimited segment (never contains a slash).
- */
-export function stripSnapshotTag(snapshotId: string): string {
-  const lastColon = snapshotId.lastIndexOf(":");
-  if (lastColon === -1) return snapshotId;
-  const tag = snapshotId.slice(lastColon + 1);
-  return tag.includes("/") ? snapshotId : snapshotId.slice(0, lastColon);
 }
 
 export function createE2BRestClient(config: E2BRestConfig): E2BRestClient {

@@ -6,7 +6,10 @@ import type { E2BImageBuildPlan } from "./types";
 function createProvider(): E2BSandboxProvider {
   return {
     triggerEnvironmentImageBuild: vi.fn(async () => ({ buildId: "build-1", status: "building" })),
-    takeSnapshot: vi.fn(async () => ({ success: true, imageId: "snap-abc:default" })),
+    takePrebuiltImageSnapshot: vi.fn(async () => ({
+      success: true,
+      imageId: "snap-abc:default",
+    })),
     deleteSandbox: vi.fn(async () => undefined),
     deleteProviderImage: vi.fn(async () => undefined),
   } as unknown as E2BSandboxProvider;
@@ -66,7 +69,7 @@ describe("E2BImageBuildAdapter", () => {
       providerImageId: "snap-abc:default",
       providerSessionId: "e2b-session-1",
     });
-    expect(provider.takeSnapshot).toHaveBeenCalledWith({
+    expect(provider.takePrebuiltImageSnapshot).toHaveBeenCalledWith({
       providerObjectId: "e2b-session-1",
       sessionId: "build-1",
       reason: "environment_image_build",
@@ -77,7 +80,10 @@ describe("E2BImageBuildAdapter", () => {
 
   it("kills the build sandbox even when the snapshot fails", async () => {
     const provider = createProvider();
-    vi.mocked(provider.takeSnapshot).mockResolvedValueOnce({ success: false, error: "boom" });
+    vi.mocked(provider.takePrebuiltImageSnapshot).mockResolvedValueOnce({
+      success: false,
+      error: "boom",
+    });
     const adapter = new E2BImageBuildAdapter(provider);
 
     await expect(
